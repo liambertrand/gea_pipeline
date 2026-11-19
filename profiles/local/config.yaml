@@ -1,0 +1,5 @@
+# Laptop / workstation.  Usage: snakemake --profile profiles/local
+cores: 4
+software-deployment-method: conda
+printshellcmds: true
+rerun-incomplete: true

@@ -1,0 +1,11 @@
+# Create once:  conda env create -f envs/snakemake.yaml && conda activate snakemake
+name: snakemake
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python >=3.11
+  - snakemake >=8
+  - snakemake-executor-plugin-slurm
+  - numpy               # for sim/simulate_gea.py

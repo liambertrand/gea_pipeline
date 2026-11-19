@@ -1,0 +1,320 @@
+# =====================================================================
+#  Environment-by-SNP (GEA) pipeline
+#  VCF + environment table  ->  RDA + LFMM2  ->  candidate SNPs/windows/genes
+#  Run:  snakemake --cores 4 --use-conda            (Snakemake 7)
+#        snakemake --cores 4 --sdm conda            (Snakemake 8+)
+#        snakemake --profile profiles/slurm         (Bridges-2)
+# =====================================================================
+import os
+import yaml
+
+# config/config.yaml is used unless another file is given with --configfile
+if not config:
+    configfile: "config/config.yaml"
+
+OUT = config["outdir"]
+# optionally restrict the run:  --config run_species=[sppA,sppB]
+SPECIES = config.get("run_species") or list(config["species"].keys())
+SCRIPTS = os.path.join(workflow.basedir, "scripts")
+ENV = "../envs/gea.yaml"
+
+# The R scripts read parameters from this snapshot of the effective config
+# (config file + any --config overrides), so every run is self-documenting.
+os.makedirs(OUT, exist_ok=True)
+CFG = os.path.join(OUT, "effective_config.yaml")
+with open(CFG, "w") as fh:
+    yaml.safe_dump(dict(config), fh, sort_keys=False)
+
+
+def sp_cfg(sp, key, default=None):
+    return config["species"][sp].get(key, default)
+
+
+def has_truth(sp):
+    return bool(sp_cfg(sp, "truth"))
+
+
+def gff_for(sp):
+    return sp_cfg(sp, "gff", config["gff"])
+
+
+def final_targets():
+    t = []
+    for sp in SPECIES:
+        t += [f"{OUT}/{sp}/genes.tsv", f"{OUT}/{sp}/report.md",
+              f"{OUT}/{sp}/plots/allele_freq_vs_env.pdf"]
+        if has_truth(sp):
+            t.append(f"{OUT}/{sp}/evaluation.tsv")
+    if len(SPECIES) > 1:
+        t.append(f"{OUT}/cross_species/gene_overlap.tsv")
+    return t
+
+
+rule all:
+    input: final_targets()
+
+
+# ---------------------------------------------------------------------
+# 1. Filtering
+# ---------------------------------------------------------------------
+rule filter_snps:
+    input:
+        vcf=lambda w: sp_cfg(w.sp, "vcf"),
+    output:
+        pgen=f"{OUT}/{{sp}}/geno/filtered.pgen",
+        pvar=f"{OUT}/{{sp}}/geno/filtered.pvar",
+        psam=f"{OUT}/{{sp}}/geno/filtered.psam",
+    params:
+        prefix=f"{OUT}/{{sp}}/geno/filtered",
+        bcf=f"{OUT}/{{sp}}/geno/prefilter.bcf",
+        q=config["filter"]["min_qual"],
+        maf=config["filter"]["maf"],
+        geno=config["filter"]["max_snp_missing"],
+        mind=config["filter"]["max_ind_missing"],
+        extra=config["filter"].get("extra_bcftools", ""),
+    threads: config["threads"]
+    log: f"{OUT}/{{sp}}/logs/filter.log"
+    conda: ENV
+    shell:
+        r"""
+        (
+        bcftools view --threads {threads} -m2 -M2 -v snps -e 'QUAL<{params.q}' {params.extra} {input.vcf} \
+          | bcftools annotate --threads {threads} --set-id '%CHROM:%POS' -Ob -o {params.bcf}
+        plink2 --bcf {params.bcf} --allow-extra-chr --rm-dup force-first \
+          --maf {params.maf} --geno {params.geno} --mind {params.mind} \
+          --threads {threads} --make-pgen --out {params.prefix}
+        rm -f {params.bcf}
+        ) > {log} 2>&1
+        """
+
+
+rule ld_prune:
+    input: rules.filter_snps.output
+    output:
+        raw=f"{OUT}/{{sp}}/geno/pruned.raw",
+        keep=f"{OUT}/{{sp}}/geno/pruned.prune.in",
+    params:
+        prefix=f"{OUT}/{{sp}}/geno/filtered",
+        out=f"{OUT}/{{sp}}/geno/pruned",
+        w=config["ld_prune"]["window_kb"],
+        s=config["ld_prune"]["step"],
+        r2=config["ld_prune"]["r2"],
+    threads: config["threads"]
+    log: f"{OUT}/{{sp}}/logs/ld_prune.log"
+    conda: ENV
+    shell:
+        r"""
+        (
+        plink2 --pfile {params.prefix} --allow-extra-chr --bad-ld --threads {threads} \
+          --indep-pairwise {params.w}kb {params.s} {params.r2} --out {params.out}
+        plink2 --pfile {params.prefix} --allow-extra-chr --threads {threads} \
+          --extract {params.out}.prune.in --export A --out {params.out}
+        ) > {log} 2>&1
+        """
+
+
+rule export_all:
+    input: rules.filter_snps.output
+    output: f"{OUT}/{{sp}}/geno/all.raw"
+    params:
+        prefix=f"{OUT}/{{sp}}/geno/filtered",
+        out=f"{OUT}/{{sp}}/geno/all",
+    threads: config["threads"]
+    log: f"{OUT}/{{sp}}/logs/export_all.log"
+    conda: ENV
+    shell:
+        "plink2 --pfile {params.prefix} --allow-extra-chr --threads {threads} "
+        "--export A --out {params.out} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 2. Population structure (PCA + sNMF) and imputation
+# ---------------------------------------------------------------------
+rule structure:
+    input:
+        pruned=rules.ld_prune.output.raw,
+        full=rules.export_all.output,
+    output:
+        pcs=f"{OUT}/{{sp}}/structure/pcs.tsv",
+        q=f"{OUT}/{{sp}}/structure/ancestry_Q.tsv",
+        k=f"{OUT}/{{sp}}/structure/K.txt",
+        geno=f"{OUT}/{{sp}}/geno/imputed.rds",
+        plot=f"{OUT}/{{sp}}/structure/structure.pdf",
+    params: outdir=f"{OUT}/{{sp}}/structure"
+    threads: config["threads"]
+    log: f"{OUT}/{{sp}}/logs/structure.log"
+    conda: ENV
+    shell:
+        "Rscript {SCRIPTS}/structure.R --config {CFG} --pruned {input.pruned} "
+        "--full {input.full} --outdir {params.outdir} --geno-out {output.geno} "
+        "--threads {threads} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 3. Environmental predictors
+# ---------------------------------------------------------------------
+rule env_prep:
+    input:
+        samples=lambda w: sp_cfg(w.sp, "samples"),
+        pcs=rules.structure.output.pcs,
+    output:
+        env=f"{OUT}/{{sp}}/env/env_selected.tsv",
+        geo=f"{OUT}/{{sp}}/env/geo.tsv",
+        log_tsv=f"{OUT}/{{sp}}/env/pruning_log.tsv",
+        plot=f"{OUT}/{{sp}}/env/env_correlations.pdf",
+        raw=f"{OUT}/{{sp}}/env/env_all_candidates_raw.tsv",
+    params: outdir=f"{OUT}/{{sp}}/env"
+    log: f"{OUT}/{{sp}}/logs/env_prep.log"
+    conda: ENV
+    shell:
+        "Rscript {SCRIPTS}/env_prep.R --config {CFG} --samples {input.samples} "
+        "--genotyped {input.pcs} --outdir {params.outdir} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 4. RDA  and  5. LFMM2  (independent, genome-wide)
+# ---------------------------------------------------------------------
+rule rda:
+    input:
+        geno=rules.structure.output.geno,
+        env=rules.env_prep.output.env,
+        geo=rules.env_prep.output.geo,
+        pcs=rules.structure.output.pcs,
+        k=rules.structure.output.k,
+    output:
+        snps=f"{OUT}/{{sp}}/rda/rda_snps.tsv.gz",
+        varpart=f"{OUT}/{{sp}}/rda/variance_partitioning.tsv",
+        summary=f"{OUT}/{{sp}}/rda/rda_summary.txt",
+        plot=f"{OUT}/{{sp}}/rda/rda_plots.pdf",
+    params: outdir=f"{OUT}/{{sp}}/rda"
+    threads: config["threads"]
+    log: f"{OUT}/{{sp}}/logs/rda.log"
+    conda: ENV
+    shell:
+        "Rscript {SCRIPTS}/rda.R --config {CFG} --geno {input.geno} --env {input.env} "
+        "--geo {input.geo} --pcs {input.pcs} --k {input.k} --outdir {params.outdir} "
+        "--threads {threads} > {log} 2>&1"
+
+
+rule lfmm:
+    input:
+        geno=rules.structure.output.geno,
+        env=rules.env_prep.output.env,
+        k=rules.structure.output.k,
+    output:
+        snps=f"{OUT}/{{sp}}/lfmm/lfmm_snps.tsv.gz",
+        gif=f"{OUT}/{{sp}}/lfmm/gif.tsv",
+        plot=f"{OUT}/{{sp}}/lfmm/lfmm_plots.pdf",
+    params: outdir=f"{OUT}/{{sp}}/lfmm"
+    log: f"{OUT}/{{sp}}/logs/lfmm.log"
+    conda: ENV
+    shell:
+        "Rscript {SCRIPTS}/lfmm.R --config {CFG} --geno {input.geno} --env {input.env} "
+        "--k {input.k} --outdir {params.outdir} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 6. Combine methods, windows, genes
+# ---------------------------------------------------------------------
+rule candidates_genes:
+    input:
+        rda=rules.rda.output.snps,
+        lfmm=rules.lfmm.output.snps,
+        gff=lambda w: gff_for(w.sp),
+    output:
+        snps=f"{OUT}/{{sp}}/candidate_snps.tsv",
+        windows=f"{OUT}/{{sp}}/windows.tsv.gz",
+        genes=f"{OUT}/{{sp}}/genes.tsv",
+        plot=f"{OUT}/{{sp}}/manhattan.pdf",
+    params: outdir=f"{OUT}/{{sp}}"
+    log: f"{OUT}/{{sp}}/logs/candidates_genes.log"
+    conda: ENV
+    shell:
+        "Rscript {SCRIPTS}/candidates_genes.R --config {CFG} --rda {input.rda} "
+        "--lfmm {input.lfmm} --gff {input.gff} --outdir {params.outdir} > {log} 2>&1"
+
+
+rule evaluate:
+    input:
+        snps=rules.candidates_genes.output.snps,
+        genes=rules.candidates_genes.output.genes,
+        rda=rules.rda.output.snps,
+        truth=lambda w: sp_cfg(w.sp, "truth"),
+        truth_genes=lambda w: sp_cfg(w.sp, "truth_genes"),
+    output: f"{OUT}/{{sp}}/evaluation.tsv"
+    log: f"{OUT}/{{sp}}/logs/evaluate.log"
+    conda: ENV
+    shell:
+        "Rscript {SCRIPTS}/evaluate.R --snps {input.snps} --genes {input.genes} "
+        "--all-snps {input.rda} --truth {input.truth} --truth-genes {input.truth_genes} "
+        "--out {output} > {log} 2>&1"
+
+
+rule report:
+    input:
+        genes=rules.candidates_genes.output.genes,
+        snps=rules.candidates_genes.output.snps,
+        varpart=rules.rda.output.varpart,
+        rda=rules.rda.output.summary,
+        gif=rules.lfmm.output.gif,
+        env_log=rules.env_prep.output.log_tsv,
+        k=rules.structure.output.k,
+        evaluation=lambda w: f"{OUT}/{w.sp}/evaluation.tsv" if has_truth(w.sp) else [],
+    output: f"{OUT}/{{sp}}/report.md"
+    log: f"{OUT}/{{sp}}/logs/report.log"
+    conda: ENV
+    shell:
+        "Rscript {SCRIPTS}/report.R --species {wildcards.sp} --dir {OUT}/{wildcards.sp} "
+        "--out {output} > {log} 2>&1"
+
+
+rule plots:
+    input:
+        genes=rules.candidates_genes.output.genes,
+        snps=rules.candidates_genes.output.snps,
+        rda=rules.rda.output.snps,
+        lfmm=rules.lfmm.output.snps,
+        geno=rules.structure.output.geno,
+        env=rules.env_prep.output.env,
+        raw=rules.env_prep.output.raw,
+        samples=lambda w: sp_cfg(w.sp, "samples"),
+        gff=lambda w: gff_for(w.sp),
+    output:
+        afreq=f"{OUT}/{{sp}}/plots/allele_freq_vs_env.pdf",
+        zoom=f"{OUT}/{{sp}}/plots/regional_zoom.pdf",
+        heat=f"{OUT}/{{sp}}/plots/gene_env_heatmap.pdf",
+        lead=f"{OUT}/{{sp}}/plots/lead_snps.tsv",
+        matrix=f"{OUT}/{{sp}}/plots/gene_env_matrix.tsv",
+    params: outdir=f"{OUT}/{{sp}}/plots"
+    log: f"{OUT}/{{sp}}/logs/plots.log"
+    conda: ENV
+    shell:
+        "Rscript {SCRIPTS}/plots.R --config {CFG} --species {wildcards.sp} --genes {input.genes} "
+        "--snps {input.snps} --rda {input.rda} --lfmm {input.lfmm} --geno {input.geno} "
+        "--env {input.env} --raw {input.raw} --samples {input.samples} --gff {input.gff} "
+        "--outdir {params.outdir} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 7. Cross-species comparison of environment-associated genes
+# ---------------------------------------------------------------------
+rule cross_species:
+    input:
+        genes=expand(f"{OUT}/{{sp}}/genes.tsv", sp=SPECIES),
+        varpart=expand(f"{OUT}/{{sp}}/rda/variance_partitioning.tsv", sp=SPECIES),
+    output:
+        overlap=f"{OUT}/cross_species/gene_overlap.tsv",
+        pairwise=f"{OUT}/cross_species/pairwise_tests.tsv",
+        plot=f"{OUT}/cross_species/overlap.pdf",
+        upset=f"{OUT}/cross_species/upset.pdf",
+        heat=f"{OUT}/cross_species/pairwise_heatmap.pdf",
+        drivers=f"{OUT}/cross_species/shared_gene_drivers.pdf",
+        varpart=f"{OUT}/cross_species/variance_partitioning.pdf",
+    params:
+        species=",".join(SPECIES),
+        outdir=f"{OUT}/cross_species",
+    log: f"{OUT}/cross_species/cross_species.log"
+    conda: ENV
+    shell:
+        "Rscript {SCRIPTS}/cross_species.R --config {CFG} --species {params.species} "
+        "--genes {input.genes} --varpart {input.varpart} --outdir {params.outdir} > {log} 2>&1"

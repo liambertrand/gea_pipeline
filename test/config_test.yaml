@@ -1,0 +1,149 @@
+# =====================================================================
+#  TEST configuration: simulated data from sim/simulate_gea.py
+#  One block per species. Every species is analysed independently with
+#  the same settings; only the cross-species step looks across them.
+# =====================================================================
+
+outdir: results_test
+
+species:
+  sppA:
+    vcf: test/data/sppA/sppA.vcf              # .vcf, .vcf.gz or .bcf
+    samples: test/data/sppA/sppA_samples.csv  # one row per individual
+    truth: test/data/sppA/truth_snps.tsv       # simulation only; delete for real data
+    truth_genes: test/data/sppA/truth_genes.tsv
+  sppB:
+    vcf: test/data/sppB/sppB.vcf
+    samples: test/data/sppB/sppB_samples.csv
+    truth: test/data/sppB/truth_snps.tsv
+    truth_genes: test/data/sppB/truth_genes.tsv
+  sppC:
+    vcf: test/data/sppC/sppC.vcf
+    samples: test/data/sppC/sppC_samples.csv
+    truth: test/data/sppC/truth_snps.tsv
+    truth_genes: test/data/sppC/truth_genes.tsv
+  sppD:
+    vcf: test/data/sppD/sppD.vcf
+    samples: test/data/sppD/sppD_samples.csv
+    truth: test/data/sppD/truth_snps.tsv
+    truth_genes: test/data/sppD/truth_genes.tsv
+
+# Gene annotation of the reference all species were mapped to: GFF3 or GTF
+# (.gff3 / .gff / .gtf, optionally .gz). The format is detected automatically.
+# If species were mapped to different references, give a per-species
+# `gff:` inside the species block and an orthology table below.
+gff: test/data/reference/annotation.gff3
+gene_feature: gene          # column 3 value to treat as a gene (GTF without gene lines: handled automatically)
+gene_id_attr: ID            # attribute holding the gene ID; ID for GFF3 (auto-switched to gene_id for GTF)
+orthology: ""               # optional TSV: species, gene_id, orthogroup
+
+# ---------------------------------------------------------------------
+# 1. SNP filtering (bcftools + plink2)
+# ---------------------------------------------------------------------
+filter:
+  min_qual: 30
+  maf: 0.05
+  max_snp_missing: 0.10     # plink2 --geno
+  max_ind_missing: 0.20     # plink2 --mind
+  extra_bcftools: ""        # e.g. "-i 'INFO/DP>500 && INFO/DP<5000'"
+
+# LD pruning (only used for population-structure estimation)
+ld_prune:
+  window_kb: 50
+  step: 1                   # must be 1 when the window is in kb (plink2)
+  r2: 0.2
+
+# ---------------------------------------------------------------------
+# 2. Population structure
+# ---------------------------------------------------------------------
+structure:
+  K_max: 6                  # sNMF tested for K = 1..K_max
+  K: auto                   # "auto" = lowest cross-entropy, or an integer
+  snmf_reps: 5
+  snmf_alpha: 10
+  n_pcs: auto               # PCs used as structure covariates; auto = K
+  impute: cluster_mode      # cluster_mode | median
+
+# ---------------------------------------------------------------------
+# 3. Environmental predictors
+# ---------------------------------------------------------------------
+env:
+  sample_id_col: sample_id
+  geo_vars: [lat, lon]      # used for spatial conditioning, NOT as predictors
+  # Numeric candidates. Elevation is deliberately left out: it is a proxy
+  # for climate + geography. Add it here if you want it tested directly.
+  candidate_vars: [bio1, bio2, bio3, bio4, bio5, bio6, bio7, bio8, bio9, bio10,
+                   bio11, bio12, bio13, bio14, bio15, bio16, bio17, bio18, bio19]
+  # Kept first during pruning when two variables are correlated
+  priority: [bio1, bio12, bio4, bio15, bio2, lc_forest, lc_shrub, lc_grass]
+  cor_threshold: 0.7
+  vif_threshold: 5
+
+  nlcd:
+    column: nlcd_class        # leave "" if no NLCD
+    mode: class               # class = point class code; proportion = columns already
+                              #   holding % cover within a buffer (list them in prop_cols)
+    prop_cols: []
+    min_freq: 0.05            # drop collapsed classes rarer than this
+    collapse:                 # NLCD code -> habitat group
+      11: water
+      21: developed
+      22: developed
+      23: developed
+      24: developed
+      31: barren
+      41: forest
+      42: forest
+      43: forest
+      52: shrub
+      71: grass
+      81: agri
+      82: agri
+      90: wetland
+      95: wetland
+
+# ---------------------------------------------------------------------
+# 4. Redundancy analysis (Capblancq & Forester 2021)
+# ---------------------------------------------------------------------
+rda:
+  condition_on: [structure, geo]   # any of: structure, geo  ([] = plain RDA)
+  K: auto                          # axes for rdadapt; auto = Kaiser-Guttman, min 2
+  permutations: 49                 # kept small for the test
+  variance_partitioning: true
+
+# ---------------------------------------------------------------------
+# 5. LFMM2 (run genome-wide, independently of RDA)
+# ---------------------------------------------------------------------
+lfmm:
+  K: auto                   # latent factors; auto = structure K
+  lambda: 1.0e-5
+  calibrate: gif
+
+# ---------------------------------------------------------------------
+# 6. Candidates, windows and genes
+# ---------------------------------------------------------------------
+candidates:
+  q_threshold: 0.05         # FDR for both methods
+  # tier1 = significant in RDA AND LFMM; tier2 = one method only
+windows:
+  size_bp: 50000
+  step_bp: 25000
+genes:
+  flank_bp: 5000            # SNPs within gene +/- flank are assigned to it
+  min_tier1_snps: 2         # a gene needs >= this many tier1 SNPs to be called
+  q_threshold: 0.05         # binomial enrichment FDR
+
+# ---------------------------------------------------------------------
+# 7. Figures
+# ---------------------------------------------------------------------
+plots:
+  top_genes: 12             # genes shown in allele-frequency and zoom plots
+  zoom_flank_bp: 100000     # region shown either side of a gene
+  pop_col: site             # samples column grouping individuals into populations;
+                            #   "" = plot individual genotypes instead
+  heatmap_max_genes: 60
+
+# ---------------------------------------------------------------------
+# Resources (used by the SLURM profile)
+# ---------------------------------------------------------------------
+threads: 4

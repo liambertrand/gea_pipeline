@@ -1,0 +1,27 @@
+# Bridges-2 SLURM profile (Snakemake 8+).  Usage:
+#   snakemake --profile profiles/slurm
+# Edit slurm_account to your allocation (e.g. `projects` shows it on Bridges-2).
+executor: slurm
+jobs: 20
+software-deployment-method: conda
+conda-prefix: ~/.snakemake_conda      # keep envs outside $HOME quota if needed (e.g. $PROJECT)
+latency-wait: 60
+rerun-incomplete: true
+printshellcmds: true
+default-resources:
+  slurm_account: "CHANGE_ME"
+  slurm_partition: "RM-shared"
+  runtime: 240          # minutes
+  mem_mb: 16000
+  cpus_per_task: 4
+set-resources:
+  structure:
+    runtime: 720
+    mem_mb: 64000
+  rda:
+    runtime: 1440
+    mem_mb: 128000
+    slurm_partition: "RM-512"
+  lfmm:
+    runtime: 720
+    mem_mb: 96000

@@ -1,0 +1,17 @@
+name: gea
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - bcftools >=1.17
+  - plink2
+  - r-base >=4.3
+  - r-yaml
+  - r-data.table
+  - r-r.utils           # lets data.table read .gz files
+  - r-vegan >=2.6
+  - r-robust            # covRob() used by rdadapt
+  - bioconductor-lea >=3.0   # sNMF + LFMM2 (lfmm2, lfmm2.test)
+  - bioconductor-qvalue
+  - r-ggplot2

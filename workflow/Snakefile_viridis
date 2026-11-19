@@ -1,0 +1,377 @@
+# =====================================================================
+#  Environment-by-SNP (GEA) pipeline -- SINGLE-SPECIES version
+#  (Crotalus viridis, CroVir3). No cross-species steps.
+#
+#  VCF + QGIS environment CSV -> RDA + LFMM2 -> candidate SNPs / windows / genes
+#  -> per-species report and figures.
+#
+#  Run with the wrapper:   bash run_viridis.sh          (checks + dry run)
+#                          bash run_viridis.sh --run    (real run)
+#  or directly:
+#    snakemake -s workflow/Snakefile_viridis --configfile config/config_viridis.yaml \
+#              --cores 8 --sdm conda
+#  At most 8 CPU threads are used in total (Snakemake --cores 8 + BLAS/OpenMP caps).
+# =====================================================================
+import csv
+import os
+import re
+import yaml
+
+if not config:
+    configfile: "config/config_viridis.yaml"
+
+SP = config["species_name"]
+OUT = config["outdir"]
+P = f"{OUT}/{SP}"                       # all results for this species
+SCRIPTS = os.path.join(workflow.basedir, "scripts")
+ENV = "../envs/gea.yaml"
+T = int(config.get("threads", 8))      # max threads for any single job
+
+# Every R/plink/bcftools process is held to its job's thread count, including the
+# multithreaded maths libraries R uses, so the total never exceeds --cores.
+def cap(n):
+    return (f"export OMP_NUM_THREADS={n} OPENBLAS_NUM_THREADS={n} MKL_NUM_THREADS={n} "
+            f"VECLIB_MAXIMUM_THREADS={n} NUMEXPR_NUM_THREADS={n}; ")
+
+os.makedirs(P, exist_ok=True)
+CFG = os.path.join(OUT, "effective_config.yaml")
+with open(CFG, "w") as fh:
+    yaml.safe_dump(dict(config), fh, sort_keys=False)
+
+
+rule all:
+    input:
+        f"{P}/genes.tsv",
+        f"{P}/report.md",
+        f"{P}/plots/allele_freq_vs_env.pdf",
+
+
+# ---------------------------------------------------------------------
+# 0. Clean the QGIS CSV: standard column names, the sample list to keep
+# ---------------------------------------------------------------------
+rule prepare_samples:
+    input: config["samples_csv"]
+    output:
+        csv=f"{P}/env/samples_clean.csv",
+        keep=f"{P}/geno/keep_samples.txt",
+    log: f"{P}/logs/prepare_samples.log"
+    run:
+        cols = config["csv_columns"]
+        with open(input[0], newline="", encoding="utf-8-sig") as fh:
+            rows = list(csv.DictReader(fh))
+        if not rows:
+            raise ValueError(f"{input[0]} has no data rows")
+        header = list(rows[0].keys())
+
+        def need(name, what):
+            if name not in header:
+                raise ValueError(f"{what} column '{name}' not in CSV. Columns are: {header}")
+            return name
+
+        id_c = need(cols["sample_id"], "sample ID")
+        lat_c = need(cols["lat"], "latitude")
+        lon_c = need(cols["lon"], "longitude")
+        site_c = cols.get("site") or ""
+        if site_c:
+            need(site_c, "site")
+        # QGIS 'Sample raster values' names columns <prefix><band>, e.g. bio1_1, nlcd_1
+        bio = {}
+        for h in header:
+            m = re.fullmatch(r"bio_?(\d+)(_\d+)?", h.strip(), flags=re.I)
+            if m and 1 <= int(m.group(1)) <= 19:
+                bio[int(m.group(1))] = h
+        missing = [f"bio{i}" for i in range(1, 20) if i not in bio]
+        if missing:
+            raise ValueError(f"bioclim columns not found: {missing}. Columns are: {header}")
+        nlcd_c = cols.get("nlcd") or ""
+        if nlcd_c:
+            need(nlcd_c, "NLCD")
+
+        out_cols = ["sample_id", "site", "lat", "lon"] + [f"bio{i}" for i in range(1, 20)] + ["nlcd_class"]
+        if not site_c:
+            out_cols.remove("site")
+        if not nlcd_c:
+            out_cols.remove("nlcd_class")
+        seen, bad, clean = set(), [], []
+        for r in rows:
+            sid = (r[id_c] or "").strip()
+            if not sid:
+                continue
+            if sid in seen:
+                raise ValueError(f"duplicate sample ID in CSV: {sid}")
+            seen.add(sid)
+            rec = {"sample_id": sid, "lat": r[lat_c], "lon": r[lon_c]}
+            if site_c:
+                rec["site"] = r[site_c]
+            for i in range(1, 20):
+                rec[f"bio{i}"] = r[bio[i]]
+            if nlcd_c:
+                v = r[nlcd_c]
+                rec["nlcd_class"] = str(int(float(v))) if v not in ("", None) else ""
+            if any(rec[c] in ("", None, "NA", "NULL") for c in out_cols):
+                bad.append(sid)
+            clean.append(rec)
+        with open(output.csv, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=out_cols)
+            w.writeheader()
+            w.writerows(clean)
+        with open(output.keep, "w") as fh:
+            fh.write("\n".join(r["sample_id"] for r in clean) + "\n")
+        with open(log[0], "w") as fh:
+            fh.write(f"{len(clean)} samples in CSV; bioclim columns: {[bio[i] for i in range(1, 20)]}\n")
+            if bad:
+                fh.write(f"samples with empty environment values: {bad}\n")
+        if bad:
+            raise ValueError(f"{len(bad)} sample(s) have empty environmental values (point on NoData?): "
+                             f"{bad[:10]} -- fix or remove them in the CSV")
+        exp = config.get("expected_samples")
+        if exp and len(clean) != int(exp):
+            print(f"WARNING: CSV has {len(clean)} samples, expected {exp}")
+
+
+# ---------------------------------------------------------------------
+# 1. Filtering (only the samples listed in the CSV are kept)
+# ---------------------------------------------------------------------
+rule filter_snps:
+    input:
+        vcf=config["vcf"],
+        keep=rules.prepare_samples.output.keep,
+    output:
+        pgen=f"{P}/geno/filtered.pgen",
+        pvar=f"{P}/geno/filtered.pvar",
+        psam=f"{P}/geno/filtered.psam",
+    params:
+        prefix=f"{P}/geno/filtered",
+        bcf=f"{P}/geno/prefilter.bcf",
+        q=config["filter"]["min_qual"],
+        maf=config["filter"]["maf"],
+        geno=config["filter"]["max_snp_missing"],
+        mind=config["filter"]["max_ind_missing"],
+        extra=config["filter"].get("extra_bcftools", ""),
+        half=lambda wildcards, threads: max(1, threads // 2),
+    threads: T
+    log: f"{P}/logs/filter.log"
+    conda: ENV
+    shell:
+        r"""
+        (
+        echo "samples requested: $(wc -l < {input.keep})"
+        bcftools view --threads {params.half} -S {input.keep} --force-samples \
+          -m2 -M2 -v snps -e 'QUAL<{params.q}' {params.extra} {input.vcf} \
+          | bcftools annotate --threads {params.half} --set-id '%CHROM:%POS' -Ob -o {params.bcf}
+        echo "samples found in VCF: $(bcftools query -l {params.bcf} | wc -l)"
+        plink2 --bcf {params.bcf} --allow-extra-chr --rm-dup force-first \
+          --maf {params.maf} --geno {params.geno} --mind {params.mind} \
+          --threads {threads} --make-pgen --out {params.prefix}
+        rm -f {params.bcf}
+        echo "samples after filtering: $(tail -n +2 {output.psam} | wc -l)"
+        echo "SNPs after filtering:    $(grep -vc '^#' {output.pvar})"
+        ) > {log} 2>&1
+        """
+
+
+rule ld_prune:
+    input: rules.filter_snps.output
+    output:
+        raw=f"{P}/geno/pruned.raw",
+        keep=f"{P}/geno/pruned.prune.in",
+    params:
+        prefix=f"{P}/geno/filtered",
+        out=f"{P}/geno/pruned",
+        w=config["ld_prune"]["window_kb"],
+        s=config["ld_prune"]["step"],
+        r2=config["ld_prune"]["r2"],
+    threads: T
+    log: f"{P}/logs/ld_prune.log"
+    conda: ENV
+    shell:
+        r"""
+        (
+        plink2 --pfile {params.prefix} --allow-extra-chr --bad-ld --threads {threads} \
+          --indep-pairwise {params.w}kb {params.s} {params.r2} --out {params.out}
+        plink2 --pfile {params.prefix} --allow-extra-chr --threads {threads} \
+          --extract {params.out}.prune.in --export A --out {params.out}
+        ) > {log} 2>&1
+        """
+
+
+rule export_all:
+    input: rules.filter_snps.output
+    output: f"{P}/geno/all.raw"
+    params:
+        prefix=f"{P}/geno/filtered",
+        out=f"{P}/geno/all",
+    threads: T
+    log: f"{P}/logs/export_all.log"
+    conda: ENV
+    shell:
+        "plink2 --pfile {params.prefix} --allow-extra-chr --threads {threads} "
+        "--export A --out {params.out} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 2. Population structure (PCA + sNMF) and imputation
+# ---------------------------------------------------------------------
+rule structure:
+    input:
+        pruned=rules.ld_prune.output.raw,
+        full=rules.export_all.output,
+    output:
+        pcs=f"{P}/structure/pcs.tsv",
+        q=f"{P}/structure/ancestry_Q.tsv",
+        k=f"{P}/structure/K.txt",
+        geno=f"{P}/geno/imputed.rds",
+        plot=f"{P}/structure/structure.pdf",
+    params: outdir=f"{P}/structure"
+    threads: T
+    log: f"{P}/logs/structure.log"
+    conda: ENV
+    shell:
+        cap(1) +
+        "Rscript {SCRIPTS}/structure.R --config {CFG} --pruned {input.pruned} "
+        "--full {input.full} --outdir {params.outdir} --geno-out {output.geno} "
+        "--threads {threads} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 3. Environmental predictors
+# ---------------------------------------------------------------------
+rule env_prep:
+    input:
+        samples=rules.prepare_samples.output.csv,
+        pcs=rules.structure.output.pcs,
+    output:
+        env=f"{P}/env/env_selected.tsv",
+        geo=f"{P}/env/geo.tsv",
+        log_tsv=f"{P}/env/pruning_log.tsv",
+        plot=f"{P}/env/env_correlations.pdf",
+        raw=f"{P}/env/env_all_candidates_raw.tsv",
+    params: outdir=f"{P}/env"
+    threads: 1
+    log: f"{P}/logs/env_prep.log"
+    conda: ENV
+    shell:
+        cap(1) +
+        "Rscript {SCRIPTS}/env_prep.R --config {CFG} --samples {input.samples} "
+        "--genotyped {input.pcs} --outdir {params.outdir} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 4. RDA  and  5. LFMM2  (independent, genome-wide)
+# ---------------------------------------------------------------------
+rule rda:
+    input:
+        geno=rules.structure.output.geno,
+        env=rules.env_prep.output.env,
+        geo=rules.env_prep.output.geo,
+        pcs=rules.structure.output.pcs,
+        k=rules.structure.output.k,
+    output:
+        snps=f"{P}/rda/rda_snps.tsv.gz",
+        varpart=f"{P}/rda/variance_partitioning.tsv",
+        summary=f"{P}/rda/rda_summary.txt",
+        plot=f"{P}/rda/rda_plots.pdf",
+    params: outdir=f"{P}/rda"
+    threads: T
+    log: f"{P}/logs/rda.log"
+    conda: ENV
+    shell:
+        # permutation tests run in {threads} parallel workers, each single-threaded
+        cap(1) +
+        "Rscript {SCRIPTS}/rda.R --config {CFG} --geno {input.geno} --env {input.env} "
+        "--geo {input.geo} --pcs {input.pcs} --k {input.k} --outdir {params.outdir} "
+        "--threads {threads} > {log} 2>&1"
+
+
+rule lfmm:
+    input:
+        geno=rules.structure.output.geno,
+        env=rules.env_prep.output.env,
+        k=rules.structure.output.k,
+    output:
+        snps=f"{P}/lfmm/lfmm_snps.tsv.gz",
+        gif=f"{P}/lfmm/gif.tsv",
+        plot=f"{P}/lfmm/lfmm_plots.pdf",
+    params: outdir=f"{P}/lfmm"
+    threads: T
+    log: f"{P}/logs/lfmm.log"
+    conda: ENV
+    shell:
+        # LFMM2's matrix algebra uses up to {threads} BLAS threads
+        cap("{threads}") +
+        "Rscript {SCRIPTS}/lfmm.R --config {CFG} --geno {input.geno} --env {input.env} "
+        "--k {input.k} --outdir {params.outdir} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 6. Combine methods, windows, genes
+# ---------------------------------------------------------------------
+rule candidates_genes:
+    input:
+        rda=rules.rda.output.snps,
+        lfmm=rules.lfmm.output.snps,
+        gff=config["annotation"],
+    output:
+        snps=f"{P}/candidate_snps.tsv",
+        windows=f"{P}/windows.tsv.gz",
+        genes=f"{P}/genes.tsv",
+        plot=f"{P}/manhattan.pdf",
+    params: outdir=P
+    threads: 1
+    log: f"{P}/logs/candidates_genes.log"
+    conda: ENV
+    shell:
+        cap(1) +
+        "Rscript {SCRIPTS}/candidates_genes.R --config {CFG} --rda {input.rda} "
+        "--lfmm {input.lfmm} --gff {input.gff} --outdir {params.outdir} > {log} 2>&1"
+
+
+# ---------------------------------------------------------------------
+# 7. Figures and report
+# ---------------------------------------------------------------------
+rule plots:
+    input:
+        genes=rules.candidates_genes.output.genes,
+        snps=rules.candidates_genes.output.snps,
+        rda=rules.rda.output.snps,
+        lfmm=rules.lfmm.output.snps,
+        geno=rules.structure.output.geno,
+        env=rules.env_prep.output.env,
+        raw=rules.env_prep.output.raw,
+        samples=rules.prepare_samples.output.csv,
+        gff=config["annotation"],
+    output:
+        afreq=f"{P}/plots/allele_freq_vs_env.pdf",
+        zoom=f"{P}/plots/regional_zoom.pdf",
+        heat=f"{P}/plots/gene_env_heatmap.pdf",
+        lead=f"{P}/plots/lead_snps.tsv",
+        matrix=f"{P}/plots/gene_env_matrix.tsv",
+    params: outdir=f"{P}/plots"
+    threads: 1
+    log: f"{P}/logs/plots.log"
+    conda: ENV
+    shell:
+        cap(1) +
+        "Rscript {SCRIPTS}/plots.R --config {CFG} --species {SP} --genes {input.genes} "
+        "--snps {input.snps} --rda {input.rda} --lfmm {input.lfmm} --geno {input.geno} "
+        "--env {input.env} --raw {input.raw} --samples {input.samples} --gff {input.gff} "
+        "--outdir {params.outdir} > {log} 2>&1"
+
+
+rule report:
+    input:
+        genes=rules.candidates_genes.output.genes,
+        snps=rules.candidates_genes.output.snps,
+        varpart=rules.rda.output.varpart,
+        rda=rules.rda.output.summary,
+        gif=rules.lfmm.output.gif,
+        env_log=rules.env_prep.output.log_tsv,
+        k=rules.structure.output.k,
+        plots=rules.plots.output.afreq,
+    output: f"{P}/report.md"
+    threads: 1
+    log: f"{P}/logs/report.log"
+    conda: ENV
+    shell:
+        cap(1) +
+        "Rscript {SCRIPTS}/report.R --species {SP} --dir {P} --out {output} > {log} 2>&1"
