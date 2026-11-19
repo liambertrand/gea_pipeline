@@ -63,7 +63,7 @@ Until these gaps are closed, results from this code should be treated as prelimi
 ## Ethics and responsible use
 
 - **Responsibility.** I am responsible for the code, the analysis choices and any results produced with it. The AI was a tool; it is not an author.
-- **Data sharing with the AI.** The raw sequencing reads, BAMs and VCFs were never shared with the AI. I did share error messages, log files, configuration files and summary output tables (for example gene and SNP result tables and the selected-predictor table) to debug the pipeline. **[Confirm this matches what you shared, and that it complies with lab and university data policies.]**
+- **Data sharing with the AI.** The raw sequencing reads, BAMs and VCFs were never shared with the AI. I did share error messages, log files, configuration files and summary output tables (for example gene and SNP result tables and the selected-predictor table) to debug the pipeline. 
 - **Sensitive locality data.** Sampling coordinates can expose rattlesnake populations to collection or disturbance. Coordinates and environmental tables are therefore excluded from this repository (see `.gitignore`).
 - **Credit.** The statistical methods belong to their original authors and are cited in `README.md` and in the scripts. The AI implemented published methods; it did not invent new ones.
 - **Transparency.** This statement records where AI was used so that others can judge the code accordingly. Where AI-written code was changed by hand, the change is recorded in the git history.
