@@ -1,0 +1,11 @@
+.DS_Store
+.snakemake/
+results*/
+logs/
+test/data/
+*.vcf.gz
+*.vcf
+*.bcf
+*.tbi
+*.csi
+*.csv
